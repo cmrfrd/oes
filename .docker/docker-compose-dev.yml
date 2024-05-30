@@ -1,0 +1,18 @@
+version: "3.7"
+
+services:
+  dev:
+    build:
+      context: ..
+      dockerfile: .docker/Dockerfile.dev
+    volumes:
+      - ..:/workspace:Z
+    network_mode: 'host'
+    entrypoint: sleep infinity
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

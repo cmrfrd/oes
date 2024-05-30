@@ -1,0 +1,50 @@
+{
+  "name": "oes",
+  "dockerComposeFile": [
+    "../.docker/docker-compose-dev.yml"
+  ],
+  "service": "dev",
+  "shutdownAction": "stopCompose",
+  "workspaceFolder": "/workspace",
+  "userEnvProbe": "loginInteractiveShell",
+  "remoteUser": "user",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "files.eol": "\n",
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer",
+          "editor.formatOnSave": true
+        },
+        "remote.extensionKind": {
+          "ms-azuretools.vscode-docker": "workspace"
+        },
+        "editor.codeActionsOnSaveTimeout": 3000,
+        "rust-analyzer.serverPath": "/usr/local/cargo/bin/rust-analyzer",
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.profiles.linux": {
+          "zsh": {
+            "path": "zsh"
+          }
+        }
+      },
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "eamodio.gitlens",
+        "davidanson.vscode-markdownlint",
+        "ms-azuretools.vscode-docker",
+        "shardulm94.trailing-spaces",
+        "bierner.emojisense",
+        "stkb.rewrap",
+        "vscode-icons-team.vscode-icons",
+        "github.vscode-pull-request-github",
+        "redhat.vscode-yaml",
+        "bajdzis.vscode-database",
+        "IBM.output-colorizer",
+        "GitHub.copilot",
+        "joaompinto.vscode-graphviz"
+      ]
+    }
+  }
+}
