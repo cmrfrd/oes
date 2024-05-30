@@ -49,6 +49,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --default-toolchain ${RUST_VERSION} && \
     rustup component add rust-src rust-analyzer-preview && \
     chown -R $USER:$USER /usr/local/rustup /usr/local/cargo
+RUN rustup update
 
 # Change to non-privileged user
 USER $USER
