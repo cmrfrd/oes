@@ -1,8 +1,3 @@
-pub enum DataType {
-    Text,
-    Image,
-}
-
 #[derive(Debug, Clone)]
 pub struct EmbeddingRequest {
     pub model: String,

@@ -25,12 +25,11 @@ use std::str::FromStr;
 
 // Update this map with more model support
 #[inline]
-pub fn model_compatability_map() -> HashMap<OesModel, Vec<InputType>> {
+pub fn model_compatability_map() -> HashMap<OesModel, Vec<DataType>> {
     let mut map = HashMap::new();
-    map.insert(
-        OesModel::OpenAIClip,
-        vec![InputType::Text, InputType::Image],
-    );
+    map.insert(OesModel::OpenAIClip, vec![DataType::Text, DataType::Image]);
+    map.insert(OesModel::LaionClip, vec![DataType::Text, DataType::Image]);
+    map.insert(OesModel::GteQwen, vec![DataType::Text]);
     map
 }
 
@@ -74,7 +73,7 @@ pub fn create_model_service_topic(
     action: OesAction,
     verb: OesVerb,
     model: OesModel,
-    input_type: InputType,
+    input_type: DataType,
     replica_id: u32,
 ) -> String {
     Path::new(

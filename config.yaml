@@ -1,0 +1,12 @@
+---
+models:
+- model_name: openai/clip-vit-base-patch32
+  encodings:
+  - data_type: image
+    replicas: 1
+  - data_type: text
+    replicas: 1
+- model_name: Alibaba-NLP/gte-Qwen1.5-7B-instruct
+  encodings:
+  - data_type: text
+    replicas: 1

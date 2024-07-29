@@ -44,11 +44,21 @@ impl<T: Clone + Debug + Unpin + Sync + Send + 'static> Broker<T> {
 }
 pub trait PubSub<T: Clone + Debug + Unpin + Sync + Send + 'static> {
     fn subscribe(&mut self, topic: String) -> RecvStream<T>;
-    async fn try_recv_many(&mut self, topic: String, n: usize) -> Vec<T>;
     fn unsubscribe(&mut self, topic: String);
-    async fn publish_single(&mut self, topic: String, messages: Vec<T>)
-        -> Result<(), SendError<T>>;
-    async fn publish_many(&mut self, messages: Vec<(String, T)>) -> Result<(), Error>;
+    fn try_recv_many(
+        &mut self,
+        topic: String,
+        n: usize,
+    ) -> impl std::future::Future<Output = Vec<T>> + Send;
+    fn publish_single(
+        &mut self,
+        topic: String,
+        messages: Vec<T>,
+    ) -> impl std::future::Future<Output = Result<(), SendError<T>>> + Send;
+    fn publish_many(
+        &mut self,
+        messages: Vec<(String, T)>,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 }
 
 impl<T: Clone + Debug + Unpin + Sync + Send + 'static> PubSub<T> for Broker<T> {
@@ -103,19 +113,6 @@ impl<T: Clone + Debug + Unpin + Sync + Send + 'static> PubSub<T> for Broker<T> {
     }
 
     async fn publish_many(&mut self, messages: Vec<(String, T)>) -> Result<(), anyhow::Error> {
-        // Ok(for (topic, message) in messages {
-        //     let tx = self
-        //         .topics
-        //         .entry(topic)
-        //         .or_insert_with(|| bounded(DEFAULT_TOPIC_CHANNEL_SIZE))
-        //         .value()
-        //         .0
-        //         .clone();
-        //     match tx.send_async(message).await {
-        //         Ok(_) => {}
-        //         Err(e) => return Err(e.into()),
-        //     };
-        // })
         let mut futs = Vec::with_capacity(messages.len());
         for (topic, message) in messages {
             let tx = self
@@ -127,9 +124,7 @@ impl<T: Clone + Debug + Unpin + Sync + Send + 'static> PubSub<T> for Broker<T> {
                 .clone();
             futs.push(tokio::spawn(async move { tx.send_async(message).await }));
         }
-        let results = join_all(futs.into_iter()).await;
-
-        Ok(for res in results {
+        Ok(for res in join_all(futs.into_iter()).await {
             match res {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => return Err(e.into()),

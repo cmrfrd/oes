@@ -1,20 +1,21 @@
 use axum::extract::DefaultBodyLimit;
 use bytes::Bytes;
 use clap::{command, Parser, Subcommand};
+use config::Config;
 use std::{net::Ipv4Addr, time::Duration};
+use strum::IntoEnumIterator;
 use tokio::net::TcpListener;
 use tower_http::{
     limit::RequestBodyLimitLayer,
     trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
     LatencyUnit,
 };
+use tracing::info;
 
 use oes::{
-    openai::server, Broker, EmbeddingMessage, OesBaseService, OesConfig, OesModelService,
+    openai::server, Broker, EmbeddingMessage, OesBaseService, OesConfig, OesModel, OesModelService,
     OesOaiService,
 };
-
-use tracing::info;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -26,6 +27,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Run(RunCli),
+    ListModels,
 }
 
 #[derive(Debug, Parser)]
@@ -37,23 +39,28 @@ pub struct RunCli {
     port: u16,
 
     #[clap(long)]
-    config: Option<String>,
+    model_config: Option<String>,
 }
 
 pub async fn start_server(addr: &str, args: RunCli) {
     tracing_subscriber::fmt().init();
-    let oes_config = match args.config {
-        Some(config) => match std::fs::read_to_string(config.clone()) {
-            Ok(config) => match serde_json::from_str::<OesConfig>(&config) {
-                Ok(config) => config,
+    let oes_model_config = match args.model_config {
+        Some(config_filename) => {
+            match Config::builder()
+                .add_source(config::File::with_name(&config_filename))
+                .build()
+            {
+                Ok(config) => match config.try_deserialize::<OesConfig>() {
+                    Ok(config) => config,
+                    Err(e) => {
+                        panic!("Error parsing config: {}", e);
+                    }
+                },
                 Err(e) => {
-                    panic!("Error parsing config: {}", e);
+                    panic!("Error reading config filename {}: {}", config_filename, e);
                 }
-            },
-            Err(e) => {
-                panic!("Error reading config {}: {}", config, e);
             }
-        },
+        }
         None => OesConfig { models: vec![] },
     };
 
@@ -61,13 +68,13 @@ pub async fn start_server(addr: &str, args: RunCli) {
     let broker = Broker::<EmbeddingMessage>::new();
 
     info!("Starting OES Models");
-    let oes_model_service = OesModelService::new(broker.clone(), oes_config.clone());
+    let oes_model_service = OesModelService::new(broker.clone(), oes_model_config.clone());
     oes_model_service.run();
 
     info!("Starting OES API");
     let oes_base = OesBaseService::new();
     let oes_base_service = OesBaseService::router(oes_base);
-    let oes_oai = OesOaiService::new(broker.clone(), oes_config.clone());
+    let oes_oai = OesOaiService::new(broker.clone(), oes_model_config.clone());
     let oes_oai_service = server::new(oes_oai);
     let app = axum::Router::new()
         .layer(DefaultBodyLimit::disable())
@@ -97,6 +104,13 @@ async fn main() {
         Commands::Run(cli_args) => {
             let addr = format!("{}:{}", cli_args.host, cli_args.port);
             start_server(&addr, cli_args).await;
+        }
+        Commands::ListModels => {
+            let models = OesModel::iter()
+                .map(|model| model.as_ref().to_string())
+                .collect::<Vec<String>>();
+            let output = serde_json::to_string_pretty(&models).expect("Failed to serialize");
+            println!("{}", output);
         }
     }
 }

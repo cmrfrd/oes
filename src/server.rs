@@ -14,27 +14,22 @@ use crate::apis::embeddings::Embeddings;
 use crate::apis::models::ListModelsResponse;
 use crate::apis::models::Models;
 use crate::apis::models::RetrieveModelResponse;
-use crate::create_model_ids;
 use crate::create_model_service_topic;
 use crate::list_models;
-use crate::model_compatability_map;
 use crate::models::Embedding;
-use crate::models::Model;
 use crate::openai::models;
 use crate::types::Nullable;
 use crate::Broker;
+use crate::DataType;
 use crate::EmbeddingMessage;
-use crate::InputType;
 use crate::OesAction;
 use crate::OesConfig;
 use crate::OesModel;
 use crate::OesVerb;
 use crate::PubSub;
-use crate::OWNER;
 use core::panic;
 use data_url::DataUrl;
 use rand::Rng;
-use std::path::Path;
 
 static MAX_BATCH_SIZE: usize = 256;
 
@@ -116,16 +111,31 @@ impl Embeddings for OesOaiService {
     /// CreateEmbedding - POST /oai/embeddings
     async fn create_embedding(
         &self,
-        method: Method,
-        host: Host,
-        cookies: CookieJar,
+        _method: Method,
+        _host: Host,
+        _cookies: CookieJar,
         body: models::CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, String> {
-        // Error check to ensure that the model is valid and exists
-        let model =
-            match serde_json::from_str::<OesModel>(&serde_json::to_string(&body.model).unwrap()) {
-                Ok(m) => m,
-                Err(_) => {
+        let (model, encoding) = {
+            let parts = body.model.split('/').collect::<Vec<_>>();
+            if parts.len() != 3 {
+                return Ok(CreateEmbeddingResponse::Status400_BadRequest(
+                    models::Error::new(
+                        Nullable::Present("400".to_string()),
+                        "Bad Request".to_string(),
+                        Nullable::Present("Invalid model and encoding".to_string()),
+                        "".to_string(),
+                    ),
+                ));
+            }
+            let (model, encoding) = (&vec![parts[0], parts[1]].join("/"), &parts[2]);
+
+            match (
+                serde_json::from_str::<OesModel>(&serde_json::to_string(model).unwrap()),
+                serde_json::from_str::<DataType>(&serde_json::to_string(encoding).unwrap()),
+            ) {
+                (Ok(m), Ok(e)) => (m, e),
+                (Err(_), _) => {
                     return Ok(CreateEmbeddingResponse::Status400_BadRequest(
                         models::Error::new(
                             Nullable::Present("400".to_string()),
@@ -135,7 +145,19 @@ impl Embeddings for OesOaiService {
                         ),
                     ));
                 }
-            };
+                (_, Err(_)) => {
+                    return Ok(CreateEmbeddingResponse::Status400_BadRequest(
+                        models::Error::new(
+                            Nullable::Present("400".to_string()),
+                            "Bad Request".to_string(),
+                            Nullable::Present(format!("Invalid encoding: {}", body.model)),
+                            "".to_string(),
+                        ),
+                    ));
+                }
+            }
+        };
+
         let model_config = match self.config.models.iter().find(|m| m.model_name == model) {
             Some(m) => m.clone(),
             None => {
@@ -144,6 +166,23 @@ impl Embeddings for OesOaiService {
                         Nullable::Present("404".to_string()),
                         "Not Found".to_string(),
                         Nullable::Present(format!("Model {:?} not found", model)),
+                        "".to_string(),
+                    ),
+                ));
+            }
+        };
+        let model_encoding_config = match model_config
+            .encodings
+            .iter()
+            .find(|e| e.data_type == encoding)
+        {
+            Some(e) => e.clone(),
+            None => {
+                return Ok(CreateEmbeddingResponse::Status400_BadRequest(
+                    models::Error::new(
+                        Nullable::Present("404".to_string()),
+                        "Not Found".to_string(),
+                        Nullable::Present(format!("Encoding {:?} not found", encoding)),
                         "".to_string(),
                     ),
                 ));
@@ -179,10 +218,10 @@ impl Embeddings for OesOaiService {
             }
         };
 
-        // check if all inputs are all image data urls or just regular text
-        let valid_inputs = input
-            .iter()
-            .map(|i| {
+        // Ensure that all the inputs (if data urls are needed) are valid
+        let all_valid_inputs = match encoding {
+            DataType::Text => true,
+            DataType::Image => input.iter().all(|i| {
                 if let Ok(data_url) = DataUrl::process(i) {
                     if data_url.mime_type().type_ == "image" {
                         if vec![String::from("png"), String::from("jpeg")]
@@ -196,11 +235,21 @@ impl Embeddings for OesOaiService {
                         false
                     }
                 } else {
-                    true
+                    false
                 }
-            })
-            .collect::<Vec<_>>();
-        if !valid_inputs.iter().all(|&x| x) {
+            }),
+            _ => {
+                return Ok(CreateEmbeddingResponse::Status400_BadRequest(
+                    models::Error::new(
+                        Nullable::Present("400".to_string()),
+                        "Bad Request".to_string(),
+                        Nullable::Present("Unsupported input type".to_string()),
+                        "".to_string(),
+                    ),
+                ))
+            }
+        };
+        if !all_valid_inputs {
             return Ok(CreateEmbeddingResponse::Status400_BadRequest(
                 models::Error::new(
                     Nullable::Present("400".to_string()),
@@ -227,16 +276,17 @@ impl Embeddings for OesOaiService {
                     .iter()
                     .map(|i| {
                         let is_data_url = DataUrl::process(&i).is_ok();
-                        let nonce: u32 = rand::thread_rng().gen::<u32>() % model_config.replicas;
+                        let nonce: u32 =
+                            rand::thread_rng().gen::<u32>() % model_encoding_config.replicas;
                         (
                             create_model_service_topic(
                                 OesAction::Embed,
                                 OesVerb::Request,
-                                OesModel::OpenAIClip,
+                                model.clone(),
                                 if is_data_url {
-                                    InputType::Image
+                                    DataType::Image
                                 } else {
-                                    InputType::Text
+                                    DataType::Text
                                 },
                                 nonce,
                             ),
