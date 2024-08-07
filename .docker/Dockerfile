@@ -51,19 +51,11 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     rustup component add rust-src rust-analyzer-preview && \
     chown -R $USER:$USER /usr/local/rustup /usr/local/cargo
 RUN rustup update
-
-# Change to non-privileged user
-USER $USER
-
-## Install oh my zsh
-# Uses "Spaceship" theme with some customization. Uses some bundled plugins and installs some more from github
-RUN sh -c "$(wget -O- https://github.com/deluan/zsh-in-docker/releases/download/v1.1.5/zsh-in-docker.sh)" -- \
-    -t https://github.com/denysdovhan/spaceship-prompt \
-    -a 'SPACESHIP_PROMPT_ADD_NEWLINE="false"' \
-    -a 'SPACESHIP_PROMPT_SEPARATE_LINE="false"' \
-    -p git \
-    -p ssh-agent \
-    -p https://github.com/zsh-users/zsh-autosuggestions \
-    -p https://github.com/zsh-users/zsh-completions
-ENV PATH="/home/$USER/.oh-my-zsh/bin:/home/$USER/.local/bin:$PATH"
 USER root
+
+COPY . /oes
+WORKDIR /oes
+RUN cargo build --release
+FROM --platform=amd64 nvidia/cuda:${CUDA_IMAGE}
+COPY --from=0 /oes/target/release/oes /usr/local/bin/oes
+CMD ["oes", "run"]
