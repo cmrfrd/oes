@@ -5,3 +5,4 @@ TAGS
 *.bk
 .idea
 src/openai
+data/
