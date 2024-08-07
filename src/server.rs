@@ -7,6 +7,7 @@ use futures::StreamExt;
 use http::Method;
 use serde_json::from_str;
 use std::fmt::Debug;
+use std::io::Cursor;
 use tracing::info;
 
 use crate::apis::embeddings::CreateEmbeddingResponse;
@@ -15,23 +16,27 @@ use crate::apis::models::ListModelsResponse;
 use crate::apis::models::Models;
 use crate::apis::models::RetrieveModelResponse;
 use crate::create_model_service_topic;
+use crate::dataurl_processor::data_type;
 use crate::list_models;
 use crate::models::Embedding;
 use crate::openai::models;
+use crate::pcm_decode_raw;
 use crate::types::Nullable;
 use crate::Broker;
 use crate::DataType;
 use crate::EmbeddingMessage;
+use crate::Input;
+use crate::ModelInfo;
 use crate::OesAction;
 use crate::OesConfig;
-use crate::OesModel;
 use crate::OesVerb;
 use crate::PubSub;
+use crate::BAD_REQUEST;
+use crate::FOUR_HUNDRED;
+use crate::MAX_BATCH_SIZE;
 use core::panic;
 use data_url::DataUrl;
 use rand::Rng;
-
-static MAX_BATCH_SIZE: usize = 256;
 
 pub struct OesBaseService {}
 
@@ -116,56 +121,35 @@ impl Embeddings for OesOaiService {
         _cookies: CookieJar,
         body: models::CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, String> {
-        let (model, encoding) = {
-            let parts = body.model.split('/').collect::<Vec<_>>();
-            if parts.len() != 3 {
+        // Parse the model info
+        let model_info: ModelInfo = match body.model.parse() {
+            Ok(m) => m,
+            Err(e) => {
                 return Ok(CreateEmbeddingResponse::Status400_BadRequest(
                     models::Error::new(
-                        Nullable::Present("400".to_string()),
-                        "Bad Request".to_string(),
-                        Nullable::Present("Invalid model and encoding".to_string()),
+                        Nullable::Present(FOUR_HUNDRED.to_string()),
+                        BAD_REQUEST.to_string(),
+                        Nullable::Present(format!("Invalid model: {}", e)),
                         "".to_string(),
                     ),
                 ));
             }
-            let (model, encoding) = (&vec![parts[0], parts[1]].join("/"), &parts[2]);
-
-            match (
-                serde_json::from_str::<OesModel>(&serde_json::to_string(model).unwrap()),
-                serde_json::from_str::<DataType>(&serde_json::to_string(encoding).unwrap()),
-            ) {
-                (Ok(m), Ok(e)) => (m, e),
-                (Err(_), _) => {
-                    return Ok(CreateEmbeddingResponse::Status400_BadRequest(
-                        models::Error::new(
-                            Nullable::Present("400".to_string()),
-                            "Bad Request".to_string(),
-                            Nullable::Present(format!("Invalid model: {}", body.model)),
-                            "".to_string(),
-                        ),
-                    ));
-                }
-                (_, Err(_)) => {
-                    return Ok(CreateEmbeddingResponse::Status400_BadRequest(
-                        models::Error::new(
-                            Nullable::Present("400".to_string()),
-                            "Bad Request".to_string(),
-                            Nullable::Present(format!("Invalid encoding: {}", body.model)),
-                            "".to_string(),
-                        ),
-                    ));
-                }
-            }
         };
 
-        let model_config = match self.config.models.iter().find(|m| m.model_name == model) {
-            Some(m) => m.clone(),
+        // Get the config for said model type
+        let model_config = match self
+            .config
+            .models
+            .iter()
+            .find(|m| m.model_name == model_info.model)
+        {
+            Some(m) => m,
             None => {
                 return Ok(CreateEmbeddingResponse::Status400_BadRequest(
                     models::Error::new(
                         Nullable::Present("404".to_string()),
                         "Not Found".to_string(),
-                        Nullable::Present(format!("Model {:?} not found", model)),
+                        Nullable::Present(format!("Model {:?} not found", model_info.model)),
                         "".to_string(),
                     ),
                 ));
@@ -174,7 +158,7 @@ impl Embeddings for OesOaiService {
         let model_encoding_config = match model_config
             .encodings
             .iter()
-            .find(|e| e.data_type == encoding)
+            .find(|e| e.data_type == model_info.data_type)
         {
             Some(e) => e.clone(),
             None => {
@@ -182,14 +166,14 @@ impl Embeddings for OesOaiService {
                     models::Error::new(
                         Nullable::Present("404".to_string()),
                         "Not Found".to_string(),
-                        Nullable::Present(format!("Encoding {:?} not found", encoding)),
+                        Nullable::Present(format!("Encoding {:?} not found", model_info.data_type)),
                         "".to_string(),
                     ),
                 ));
             }
         };
 
-        // Ensure the input is valid
+        // Ensure the input is valid batch size
         let input = {
             let input = serde_json::to_string(&body.input).unwrap();
             if let Ok(single) = from_str::<String>(&input) {
@@ -209,8 +193,8 @@ impl Embeddings for OesOaiService {
             Err(e) => {
                 return Ok(CreateEmbeddingResponse::Status400_BadRequest(
                     models::Error::new(
-                        Nullable::Present("400".to_string()),
-                        "Bad Request".to_string(),
+                        Nullable::Present(FOUR_HUNDRED.to_string()),
+                        BAD_REQUEST.to_string(),
                         Nullable::Present(e),
                         "".to_string(),
                     ),
@@ -218,47 +202,119 @@ impl Embeddings for OesOaiService {
             }
         };
 
-        // Ensure that all the inputs (if data urls are needed) are valid
-        let all_valid_inputs = match encoding {
-            DataType::Text => true,
-            DataType::Image => input.iter().all(|i| {
-                if let Ok(data_url) = DataUrl::process(i) {
-                    if data_url.mime_type().type_ == "image" {
-                        if vec![String::from("png"), String::from("jpeg")]
-                            .contains(&data_url.mime_type().subtype)
-                        {
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
+        let converted_inputs: Result<Vec<Input>, String> = match model_info.data_type {
+            DataType::Text => input.iter().try_fold(Vec::new(), |mut acc, i| {
+                match DataUrl::process(i) {
+                    Ok(data_url) => {
+                        let data_type = data_type(&data_url).map_err(|e| e.to_string())?;
+                        (data_type == DataType::Text)
+                            .then(|| ())
+                            .ok_or_else(|| "Invalid input".to_string())?;
+                        let (raw_data, _) = data_url.decode_to_vec().map_err(|e| e.to_string())?;
+                        acc.push(Input::Text(String::from_utf8_lossy(&raw_data).to_string()));
                     }
-                } else {
-                    false
+                    // If the input is not a data url, assume it's normal text
+                    Err(_) => {
+                        let owned_i = i.to_owned();
+                        acc.push(Input::Text(owned_i));
+                    }
                 }
+                Ok(acc)
             }),
-            _ => {
+            DataType::Image => input.iter().try_fold(Vec::new(), |mut acc, i| {
+                let data_url = DataUrl::process(i).map_err(|e| e.to_string())?;
+                let data_type = data_type(&data_url).map_err(|e| e.to_string())?;
+                (data_type == DataType::Image)
+                    .then(|| ())
+                    .ok_or_else(|| "Invalid input".to_string())?;
+                let raw_data = data_url.decode_to_vec().map_err(|e| e.to_string())?.0;
+                let img = image::load_from_memory(&raw_data).map_err(|e| e.to_string())?;
+                acc.push(Input::Image(img));
+                Ok(acc)
+            }),
+            DataType::Audio => input.iter().try_fold(Vec::new(), |mut acc, i| {
+                let data_url = DataUrl::process(i).map_err(|e| e.to_string())?;
+                let data_type = data_type(&data_url).map_err(|e| e.to_string())?;
+                (data_type == DataType::Audio)
+                    .then(|| ())
+                    .ok_or_else(|| "Invalid input".to_string())?;
+                let raw_data = data_url.decode_to_vec().map_err(|e| e.to_string())?.0;
+                let media_source = Box::new(Cursor::new(raw_data));
+                let (aud, sample_rate) = pcm_decode_raw(media_source).map_err(|e| e.to_string())?;
+                acc.push(Input::Audio((aud, sample_rate)));
+                Ok(acc)
+            }),
+        };
+        let converted_inputs = match converted_inputs {
+            Ok(i) => i,
+            Err(e) => {
                 return Ok(CreateEmbeddingResponse::Status400_BadRequest(
                     models::Error::new(
-                        Nullable::Present("400".to_string()),
-                        "Bad Request".to_string(),
-                        Nullable::Present("Unsupported input type".to_string()),
+                        Nullable::Present(FOUR_HUNDRED.to_string()),
+                        BAD_REQUEST.to_string(),
+                        Nullable::Present(e),
                         "".to_string(),
                     ),
                 ))
             }
         };
-        if !all_valid_inputs {
-            return Ok(CreateEmbeddingResponse::Status400_BadRequest(
-                models::Error::new(
-                    Nullable::Present("400".to_string()),
-                    "Bad Request".to_string(),
-                    Nullable::Present("Invalid input".to_string()),
-                    "".to_string(),
-                ),
-            ));
-        }
+
+        // // Ensure that all the inputs (if data urls are needed) are valid
+        // let all_valid_inputs = match model_info.data_type {
+        //     DataType::Text => true,
+        //     DataType::Image => input.iter().all(|i| {
+        //         if let Ok(data_url) = DataUrl::process(i) {
+        //             if data_url.mime_type().type_ == "image" {
+        //                 if vec![String::from("png"), String::from("jpeg")]
+        //                     .contains(&data_url.mime_type().subtype)
+        //                 {
+        //                     true
+        //                 } else {
+        //                     false
+        //                 }
+        //             } else {
+        //                 false
+        //             }
+        //         } else {
+        //             false
+        //         }
+        //     }),
+        //     DataType::Audio => input.iter().all(|i| {
+        //         if let Ok(data_url) = DataUrl::process(i) {
+        //             if data_url.mime_type().type_ == "audio" {
+        //                 if vec![String::from("wav")].contains(&data_url.mime_type().subtype) {
+        //                     true
+        //                 } else {
+        //                     false
+        //                 }
+        //             } else {
+        //                 false
+        //             }
+        //         } else {
+        //             false
+        //         }
+        //     }),
+        //     _ => {
+        //         return Ok(CreateEmbeddingResponse::Status400_BadRequest(
+        //             models::Error::new(
+        //                 Nullable::Present(FOUR_HUNDRED.to_string()),
+        //                 BAD_REQUEST.to_string(),
+        //                 Nullable::Present("Unsupported input type".to_string()),
+        //                 "".to_string(),
+        //             ),
+        //         ))
+        //     }
+        // };
+        // if !all_valid_inputs {
+        //     return Ok(CreateEmbeddingResponse::Status400_BadRequest(
+        //         models::Error::new(
+        //             Nullable::Present(FOUR_HUNDRED.to_string()),
+        //             BAD_REQUEST.to_string(),
+        //             Nullable::Present("Invalid input".to_string()),
+        //             "".to_string(),
+        //         ),
+        //     ));
+        // }
 
         // create a rendezvous topic for pubsub to return
         // and subscribe to it.
@@ -272,67 +328,112 @@ impl Embeddings for OesOaiService {
         info!("Submitting embeddings request: {}", rendezvous_topic);
         let (_, embeddings) = tokio::join!(
             tokio::spawn(async move {
-                let messages = input
-                    .iter()
-                    .map(|i| {
-                        let is_data_url = DataUrl::process(&i).is_ok();
-                        let nonce: u32 =
-                            rand::thread_rng().gen::<u32>() % model_encoding_config.replicas;
-                        (
-                            create_model_service_topic(
+                let messages =
+                    converted_inputs
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .zip((0..input_size).into_iter().map(|_| {
+                            rand::thread_rng().gen::<u32>() % model_encoding_config.replicas
+                        }))
+                        .map(|((index, input), nonce)| (index, input, nonce))
+                        .map(|(index, input, nonce)| {
+                            let topic = create_model_service_topic(
                                 OesAction::Embed,
                                 OesVerb::Request,
-                                model.clone(),
-                                if is_data_url {
-                                    DataType::Image
-                                } else {
-                                    DataType::Text
-                                },
+                                model_info.model.clone(),
+                                model_info.data_type.clone(),
                                 nonce,
-                            ),
-                            EmbeddingMessage::Request(crate::EmbeddingRequest {
-                                model: "clip".to_string(),
-                                input: i.clone(),
-                                rendezvous_topic: rendezvous_topic.clone(),
-                            }),
-                        )
-                    })
-                    .collect::<Vec<_>>();
+                            );
+                            let req = crate::EmbeddingRequest::new(
+                                input.clone(),
+                                rendezvous_topic.clone(),
+                                index.try_into().unwrap(),
+                            );
+                            let message = EmbeddingMessage::Request(req);
+
+                            (topic, message)
+                        })
+                        .collect();
                 client_send.publish_many(messages).await.unwrap();
             }),
             tokio::spawn(async move {
                 let mut embeddings = Vec::with_capacity(input_size);
-                client_recv
+                let mut subs_stream = client_recv
                     .subscribe(also_rendezvous_topic.clone())
-                    .take(input_size)
-                    .collect::<Vec<_>>()
-                    .await
-                    .into_iter()
-                    .enumerate()
-                    .for_each(|(i, v)| match v {
-                        EmbeddingMessage::Response(r) => {
-                            embeddings.push(Embedding::new(
-                                i.try_into().unwrap(),
-                                r.values.clone(),
-                                "".to_string(),
-                            ));
-                        }
-                        _ => {
-                            panic!("Invalid response");
-                        }
-                    });
-                embeddings
+                    .take(input_size);
+                while let Some(entry) = subs_stream.next().await {
+                    match entry {
+                        EmbeddingMessage::Response(r) => embeddings.push(Embedding::new(
+                            r.ordinal.try_into().unwrap(),
+                            r.values.clone(),
+                            "".to_string(),
+                        )),
+                        EmbeddingMessage::Error(e) => anyhow::bail!(e),
+                        _ => anyhow::bail!("Invalid internal message"),
+                    }
+                }
+                embeddings.sort_by(|a, b| a.index.cmp(&b.index));
+                Ok(embeddings)
+
+                // let embeddings: Vec<Embedding> = client_recv
+                //     .subscribe(also_rendezvous_topic.clone())
+                //     .take(input_size)
+                //     .collect::<Vec<_>>()
+                //     .await
+                //     .into_iter()
+                //     .try_fold(Vec::with_capacity(input_size), |mut acc, v| match v {
+                //         EmbeddingMessage::Response(r) => {
+                //             acc.push(Embedding::new(
+                //                 r.ordinal.try_into().unwrap(),
+                //                 r.values.clone(),
+                //                 "".to_string(),
+                //             ));
+                //             Ok(acc)
+                //         }
+                //         EmbeddingMessage::Error(e) => Err(e)?,
+                //         // _ => panic!("Invalid response"),
+                //         _ => {}
+                //     });
+                // // embeddings.sort_by(|a, b| a.index.cmp(&b.index));
+                // info!("Received embeddings response: {}", also_rendezvous_topic);
+                // embeddings
+                // Vec::new()
             })
         );
 
-        return Ok(CreateEmbeddingResponse::Status200_OK(
-            models::CreateEmbeddingResponse {
-                data: embeddings.unwrap(),
-                model: "clip".to_string(),
-                object: "".to_string(),
-                usage: models::CreateEmbeddingResponseUsage::new(0, 0),
+        match embeddings {
+            Err(e) => {
+                return Ok(CreateEmbeddingResponse::Status500_InternalServerError(
+                    models::Error::new(
+                        Nullable::Present("500".to_string()),
+                        "Internal Server Error".to_string(),
+                        Nullable::Present(e.to_string()),
+                        "".to_string(),
+                    ),
+                ));
+            }
+            Ok(embeddings) => match embeddings {
+                Err(e) => {
+                    return Ok(CreateEmbeddingResponse::Status500_InternalServerError(
+                        models::Error::new(
+                            Nullable::Present("500".to_string()),
+                            "Internal Server Error".to_string(),
+                            Nullable::Present(e.to_string()),
+                            "".to_string(),
+                        ),
+                    ));
+                }
+                Ok(embeddings) => Ok(CreateEmbeddingResponse::Status200_OK(
+                    models::CreateEmbeddingResponse {
+                        data: embeddings,
+                        model: model_info.model.as_ref().to_string(),
+                        object: "".to_string(),
+                        usage: models::CreateEmbeddingResponseUsage::new(0, 0),
+                    },
+                )),
             },
-        ));
+        }
     }
 }
 

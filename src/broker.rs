@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::{collections::HashMap, fmt::Debug};
 
 #[derive(Clone)]
-pub struct Broker<T: Clone> {
+pub struct Broker<T> {
     topics: Arc<DashMap<String, (Sender<T>, Receiver<T>)>>,
 }
 
-impl<T: Clone> Default for Broker<T> {
+impl<T> Default for Broker<T> {
     fn default() -> Self {
         Self {
             topics: Arc::new(DashMap::new()),
@@ -22,13 +22,13 @@ impl<T: Clone> Default for Broker<T> {
     }
 }
 
-impl<T: Clone> AsRef<Broker<T>> for Broker<T> {
+impl<T> AsRef<Broker<T>> for Broker<T> {
     fn as_ref(&self) -> &Broker<T> {
         self
     }
 }
 
-impl<T: Clone + Debug + Unpin + Sync + Send + 'static> Broker<T> {
+impl<T: Debug + Unpin + Sync + Send + 'static> Broker<T> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -42,7 +42,8 @@ impl<T: Clone + Debug + Unpin + Sync + Send + 'static> Broker<T> {
         capacities
     }
 }
-pub trait PubSub<T: Clone + Debug + Unpin + Sync + Send + 'static> {
+pub trait PubSub<T: Debug + Unpin + Sync + Send + 'static> {
+    fn has_topic(&self, topic: &str) -> bool;
     fn subscribe(&mut self, topic: String) -> RecvStream<T>;
     fn unsubscribe(&mut self, topic: String);
     fn try_recv_many(
@@ -61,7 +62,11 @@ pub trait PubSub<T: Clone + Debug + Unpin + Sync + Send + 'static> {
     ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 }
 
-impl<T: Clone + Debug + Unpin + Sync + Send + 'static> PubSub<T> for Broker<T> {
+impl<T: Debug + Unpin + Sync + Send + 'static> PubSub<T> for Broker<T> {
+    fn has_topic(&self, topic: &str) -> bool {
+        self.topics.contains_key(topic)
+    }
+
     fn subscribe(&mut self, topic: String) -> RecvStream<T> {
         self.topics
             .entry(topic)

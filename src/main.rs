@@ -4,17 +4,17 @@ use clap::{command, Parser, Subcommand};
 use config::Config;
 use std::{net::Ipv4Addr, time::Duration};
 use strum::IntoEnumIterator;
+use tabled::{builder::Builder, settings::Style};
 use tokio::net::TcpListener;
 use tower_http::{
-    limit::RequestBodyLimitLayer,
     trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
     LatencyUnit,
 };
 use tracing::info;
 
 use oes::{
-    openai::server, Broker, EmbeddingMessage, OesBaseService, OesConfig, OesModel, OesModelService,
-    OesOaiService,
+    model_compatability_map, openai::server, Broker, DataType, EmbeddingMessage, OesBaseService,
+    OesConfig, OesModelService, OesOaiService,
 };
 
 #[derive(Parser, Debug)]
@@ -77,8 +77,10 @@ pub async fn start_server(addr: &str, args: RunCli) {
     let oes_oai = OesOaiService::new(broker.clone(), oes_model_config.clone());
     let oes_oai_service = server::new(oes_oai);
     let app = axum::Router::new()
+        // .layer(DefaultBodyLimit::max(1000 * 1000 * 1000))
         .layer(DefaultBodyLimit::disable())
-        .layer(RequestBodyLimitLayer::new(50 * 1000 * 1000))
+        // .layer(RequestBodyLimitLayer::new(1000 * 1000 * 1000)) // 1GB
+        // .layer(extractor_middleware::<ContentLengthLimit<(), 1024>>())
         .layer(
             TraceLayer::new_for_http()
                 .on_body_chunk(|chunk: &Bytes, latency: Duration, _: &tracing::Span| {
@@ -88,7 +90,9 @@ pub async fn start_server(addr: &str, args: RunCli) {
                 .on_response(DefaultOnResponse::new().include_headers(true).latency_unit(LatencyUnit::Micros)),
         )
         // All requests that prefix /oai will go here
+        .layer(DefaultBodyLimit::disable())
         .nest("/", oes_oai_service)
+        .layer(DefaultBodyLimit::disable())
         // All other requests will go here
         .nest("/", oes_base_service);
 
@@ -106,11 +110,35 @@ async fn main() {
             start_server(&addr, cli_args).await;
         }
         Commands::ListModels => {
-            let models = OesModel::iter()
+            let res = model_compatability_map();
+            let base_col = vec!["Model ID".to_string()];
+            let data_type_cols = DataType::iter()
                 .map(|model| model.as_ref().to_string())
-                .collect::<Vec<String>>();
-            let output = serde_json::to_string_pretty(&models).expect("Failed to serialize");
-            println!("{}", output);
+                .collect::<Vec<_>>();
+            let all_cols = base_col
+                .iter()
+                .chain(data_type_cols.iter())
+                .map(|s| s.clone())
+                .collect::<Vec<_>>();
+
+            let mut table_data = vec![all_cols];
+            let mut kvs = res.iter().collect::<Vec<_>>();
+            kvs.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+            for (model, data_types) in kvs {
+                let mut row = vec![model.as_ref().to_string()];
+                for data_type in DataType::iter() {
+                    if data_types.contains(&data_type) {
+                        row.push("X".to_string());
+                    } else {
+                        row.push("".to_string());
+                    }
+                }
+                table_data.push(row);
+            }
+
+            let mut table = Builder::from_iter(table_data).build();
+            table.with(Style::rounded());
+            println!("{}", table);
         }
     }
 }

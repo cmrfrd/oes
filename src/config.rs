@@ -50,17 +50,20 @@ pub struct OesModelEncodingsConfig {
     pub device: OesDevice,
 }
 
-#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Hash, Clone)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Hash, Clone, EnumIter, AsRefStr)]
 pub enum DataType {
     #[serde(rename = "text")]
+    #[strum(serialize = "text")]
     Text,
     #[serde(rename = "image")]
+    #[strum(serialize = "image")]
     Image,
     #[serde(rename = "audio")]
+    #[strum(serialize = "audio")]
     Audio,
 }
 
-#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Hash, Clone, EnumIter, AsRefStr, )]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Hash, Clone, EnumIter, AsRefStr, Copy)]
 pub enum OesModel {
     #[serde(rename = "openai/clip-vit-base-patch32")]
     #[strum(serialize = "openai/clip-vit-base-patch32")]
@@ -68,10 +71,10 @@ pub enum OesModel {
     #[serde(rename = "laion/CLIP-ViT-B-16-laion2B-s34B-b88K")]
     #[strum(serialize = "laion/CLIP-ViT-B-16-laion2B-s34B-b88K")]
     LaionClip,
-    // #[serde(rename = "microsoft/phi-2")]
-    // #[strum(serialize = "microsoft/phi-2")]
-    // Phi2,
     #[serde(rename = "Alibaba-NLP/gte-Qwen1.5-7B-instruct")]
     #[strum(serialize = "Alibaba-NLP/gte-Qwen1.5-7B-instruct")]
     GteQwen,
+    #[serde(rename = "openai/whisper-large-v2")]
+    #[strum(serialize = "openai/whisper-large-v2")]
+    Whisper,
 }

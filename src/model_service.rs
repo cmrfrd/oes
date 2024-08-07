@@ -1,14 +1,15 @@
-use candle_core::quantized::gguf_file;
+use std::path::{Path, PathBuf};
+
 use candle_transformers::models::clip::{self, ClipConfig};
-use candle_transformers::models::qwen2::{self, Config, Model};
-use data_url::DataUrl;
-use hf_hub::api::sync::Api;
+use candle_transformers::models::qwen2::{Config as QwenConfig, Model as QwenModel};
+use candle_transformers::models::whisper::{self as m, audio, Config};
+use itertools::Itertools;
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 use tracing::{error, info, warn};
 
 use crate::{
     create_model_service_topic, Broker, DataType, EmbeddingMessage, OesAction, OesConfig, OesModel,
-    OesVerb, PubSub, MAX_BATCH_SIZE_CLIP_TEXT,
+    OesVerb, PubSub, MAX_BATCH_SIZE,
 };
 
 use anyhow::Error as E;
@@ -56,10 +57,7 @@ impl OesModelService {
                                     // Collect messages from broker, filter out non-request messages,
                                     // and continue if no messages are received
                                     let received_messages = local_broker
-                                        .try_recv_many(
-                                            receive_topic.clone(),
-                                            MAX_BATCH_SIZE_CLIP_TEXT,
-                                        )
+                                        .try_recv_many(receive_topic.clone(), MAX_BATCH_SIZE)
                                         .await
                                         .into_iter()
                                         .filter_map(|m| match m {
@@ -75,20 +73,57 @@ impl OesModelService {
                                         continue;
                                     }
 
-                                    // tokenization and processing of the received messages
-                                    let (input_ids, _) = tokenize_sequences(
-                                        received_messages
-                                            .iter()
-                                            .map(|r| r.input.clone())
-                                            .collect::<Vec<String>>(),
-                                        &tokenizer,
-                                        &device,
-                                    )
-                                    .unwrap();
-                                    tokio::task::yield_now().await;
+                                    // ensure the request inputs are valid, for invalid requests send an err
+                                    // to their rendezvous topics if they exist
+                                    let mut send_err_broker = local_broker.clone();
+                                    let (valid_received_messages, invalid_received_messages): (
+                                        Vec<_>,
+                                        Vec<_>,
+                                    ) = received_messages.into_iter().partition(
+                                        |received_message| match received_message.payload {
+                                            crate::Input::Text(_) => true,
+                                            _ => {
+                                                error!(
+                                                    "Received non-text input: {:?}",
+                                                    received_message
+                                                );
+                                                false
+                                            }
+                                        },
+                                    );
+                                    let valid_received_messages_headers = valid_received_messages
+                                        .iter()
+                                        .map(|r| r.header.clone())
+                                        .collect::<Vec<_>>();
+                                    let inputs = valid_received_messages
+                                        .into_iter()
+                                        .map(|r| match r.payload {
+                                            crate::Input::Text(t) => t,
+                                            _ => unreachable!(),
+                                        })
+                                        .collect::<Vec<_>>();
+                                    tokio::spawn(async move {
+                                        let responses = invalid_received_messages
+                                            .into_iter()
+                                            .map(|r| r.header.rendezvous_topic.to_string())
+                                            .unique()
+                                            .filter(|r| send_err_broker.has_topic(r))
+                                            .map(|r| {
+                                                (
+                                                    r.to_string(),
+                                                    EmbeddingMessage::Error(
+                                                        "Invalid input".to_string(),
+                                                    ),
+                                                )
+                                            })
+                                            .collect::<Vec<_>>();
+                                        send_err_broker.publish_many(responses).await.unwrap();
+                                    });
 
-                                    // Get the text features
-                                    let text_features = model
+                                    // Process embeddings
+                                    let (input_ids, _) =
+                                        tokenize_sequences(inputs, &tokenizer, &device).unwrap();
+                                    let text_embeddings = model
                                         .get_text_features(&input_ids)
                                         .unwrap()
                                         .to_vec2::<f32>()
@@ -98,19 +133,23 @@ impl OesModelService {
                                     // Send the responses back to the broker
                                     let mut send_broker = local_broker.clone();
                                     tokio::spawn(async move {
-                                        let responses = received_messages
+                                        let responses = valid_received_messages_headers
                                             .iter()
-                                            .map(|r| r.rendezvous_topic.to_string())
-                                            .zip(text_features.iter().map(|f| {
-                                                EmbeddingMessage::Response(
-                                                    crate::EmbeddingResponse {
-                                                        values: f
-                                                            .iter()
-                                                            .map(|v| *v as f64)
-                                                            .collect(),
-                                                    },
+                                            .zip(text_embeddings.iter())
+                                            .map(|(header, embedding)| {
+                                                (
+                                                    header.rendezvous_topic.to_string(),
+                                                    EmbeddingMessage::Response(
+                                                        crate::EmbeddingResponse {
+                                                            values: embedding
+                                                                .iter()
+                                                                .map(|v| *v as f64)
+                                                                .collect(),
+                                                            ordinal: header.ordinal,
+                                                        },
+                                                    ),
                                                 )
-                                            }))
+                                            })
                                             .collect::<Vec<_>>();
                                         send_broker.publish_many(responses).await.unwrap();
                                     });
@@ -138,10 +177,7 @@ impl OesModelService {
                                     // Collect messages from broker, filter out non-request messages,
                                     // and continue if no messages are received
                                     let received_messages = local_broker
-                                        .try_recv_many(
-                                            receive_topic.clone(),
-                                            MAX_BATCH_SIZE_CLIP_TEXT,
-                                        )
+                                        .try_recv_many(receive_topic.clone(), MAX_BATCH_SIZE)
                                         .await
                                         .into_iter()
                                         .filter_map(|m| match m {
@@ -157,18 +193,56 @@ impl OesModelService {
                                         continue;
                                     }
 
-                                    // Get the image features
-                                    let images = received_messages
+                                    // ensure the request inputs are valid, for invalid requests send an err
+                                    // to their rendezvous topics if they exist
+                                    let mut send_err_broker = local_broker.clone();
+                                    let (valid_received_messages, invalid_received_messages): (
+                                        Vec<_>,
+                                        Vec<_>,
+                                    ) = received_messages.into_iter().partition(
+                                        |received_message| match received_message.payload {
+                                            crate::Input::Image(_) => true,
+                                            _ => {
+                                                error!(
+                                                    "Received non-image input: {:?}",
+                                                    received_message
+                                                );
+                                                false
+                                            }
+                                        },
+                                    );
+                                    let valid_received_messages_headers = valid_received_messages
                                         .iter()
-                                        .map(|r| r.input.clone())
-                                        .map(|i| {
-                                            DataUrl::process(&i.clone())
-                                                .unwrap()
-                                                .decode_to_vec()
-                                                .unwrap()
-                                                .0
+                                        .map(|r| r.header.clone())
+                                        .collect::<Vec<_>>();
+                                    let inputs = valid_received_messages
+                                        .into_iter()
+                                        .map(|r| match r.payload {
+                                            crate::Input::Image(t) => t,
+                                            _ => unreachable!(),
                                         })
-                                        .map(|data| image::load_from_memory(&data).unwrap())
+                                        .collect::<Vec<_>>();
+                                    tokio::spawn(async move {
+                                        let responses = invalid_received_messages
+                                            .into_iter()
+                                            .map(|r| r.header.rendezvous_topic.to_string())
+                                            .unique()
+                                            .filter(|r| send_err_broker.has_topic(r))
+                                            .map(|r| {
+                                                (
+                                                    r.to_string(),
+                                                    EmbeddingMessage::Error(
+                                                        "Invalid input".to_string(),
+                                                    ),
+                                                )
+                                            })
+                                            .collect::<Vec<_>>();
+                                        send_err_broker.publish_many(responses).await.unwrap();
+                                    });
+
+                                    // Get the image features
+                                    let images = inputs
+                                        .iter()
                                         .map(|img| {
                                             let (height, width) =
                                                 (config.image_size, config.image_size);
@@ -195,10 +269,7 @@ impl OesModelService {
                                             img
                                         })
                                         .collect::<Vec<_>>();
-                                    tokio::task::yield_now().await;
-
-                                    // Get the image features
-                                    let image_features = model
+                                    let image_embeddings = model
                                         .get_image_features(
                                             &Tensor::stack(&images, 0)
                                                 .unwrap()
@@ -213,19 +284,23 @@ impl OesModelService {
                                     // Send the responses back to the broker
                                     let mut send_broker = local_broker.clone();
                                     tokio::spawn(async move {
-                                        let responses = received_messages
+                                        let responses = valid_received_messages_headers
                                             .iter()
-                                            .map(|r| r.rendezvous_topic.to_string())
-                                            .zip(image_features.iter().map(|f| {
-                                                EmbeddingMessage::Response(
-                                                    crate::EmbeddingResponse {
-                                                        values: f
-                                                            .iter()
-                                                            .map(|v| *v as f64)
-                                                            .collect(),
-                                                    },
+                                            .zip(image_embeddings.iter())
+                                            .map(|(header, embedding)| {
+                                                (
+                                                    header.rendezvous_topic.to_string(),
+                                                    EmbeddingMessage::Response(
+                                                        crate::EmbeddingResponse {
+                                                            values: embedding
+                                                                .iter()
+                                                                .map(|v| *v as f64)
+                                                                .collect(),
+                                                            ordinal: header.ordinal,
+                                                        },
+                                                    ),
                                                 )
-                                            }))
+                                            })
                                             .collect::<Vec<_>>();
                                         send_broker.publish_many(responses).await.unwrap();
                                     });
@@ -235,7 +310,7 @@ impl OesModelService {
                     }
                     (OesModel::GteQwen, DataType::Text) => {
                         for replica_id in 0..encodings_config.replicas {
-                            let (tokenizer, mut model, device) = init_gtwqwen();
+                            let (tokenizer, mut model, device) = init_gteqwen();
                             let mut local_broker = self.broker.clone();
                             let receive_topic = create_model_service_topic(
                                 OesAction::Embed,
@@ -259,10 +334,7 @@ impl OesModelService {
                                     // Collect messages from broker, filter out non-request messages,
                                     // and continue if no messages are received
                                     let received_messages = local_broker
-                                        .try_recv_many(
-                                            receive_topic.clone(),
-                                            MAX_BATCH_SIZE_CLIP_TEXT,
-                                        )
+                                        .try_recv_many(receive_topic.clone(), MAX_BATCH_SIZE)
                                         .await
                                         .into_iter()
                                         .filter_map(|m| match m {
@@ -277,17 +349,70 @@ impl OesModelService {
                                         tokio::task::yield_now().await;
                                         continue;
                                     }
-                                    info!("Received {} messages", received_messages.len());
+                                    info!("Received {:?} messages", received_messages.len());
 
+                                    // ensure the request inputs are valid, for invalid requests send an err
+                                    // to their rendezvous topics if they exist
+                                    let mut send_err_broker = local_broker.clone();
+                                    let (valid_received_messages, invalid_received_messages): (
+                                        Vec<_>,
+                                        Vec<_>,
+                                    ) = received_messages.into_iter().partition(
+                                        |received_message| match received_message.payload {
+                                            crate::Input::Text(_) => true,
+                                            _ => {
+                                                error!(
+                                                    "Received non-text input: {:?}",
+                                                    received_message
+                                                );
+                                                false
+                                            }
+                                        },
+                                    );
+                                    let valid_received_messages_headers = valid_received_messages
+                                        .iter()
+                                        .map(|r| r.header.clone())
+                                        .collect::<Vec<_>>();
+                                    let inputs = valid_received_messages
+                                        .into_iter()
+                                        .map(|r| match r.payload {
+                                            crate::Input::Text(t) => t,
+                                            _ => unreachable!(),
+                                        })
+                                        .collect::<Vec<_>>();
+                                    tokio::spawn(async move {
+                                        let responses = invalid_received_messages
+                                            .into_iter()
+                                            .map(|r| r.header.rendezvous_topic.to_string())
+                                            .unique()
+                                            .filter(|r| send_err_broker.has_topic(r))
+                                            .map(|r| {
+                                                (
+                                                    r.to_string(),
+                                                    EmbeddingMessage::Error(
+                                                        "Invalid input".to_string(),
+                                                    ),
+                                                )
+                                            })
+                                            .collect::<Vec<_>>();
+                                        send_err_broker.publish_many(responses).await.unwrap();
+                                    });
+
+                                    // Process embeddings
+                                    let inputs = inputs
+                                        .into_iter()
+                                        .map(|m| {
+                                            // Very strange hack, but is needed for good results
+                                            if m.ends_with("<|endoftext|>") {
+                                                m
+                                            } else {
+                                                format!("{}<|endoftext|>", m)
+                                            }
+                                        })
+                                        .collect::<Vec<_>>();
                                     let encoded = tokenizer
-                                        .encode_batch(
-                                            received_messages
-                                                .iter()
-                                                .map(|r| r.input.clone())
-                                                .collect::<Vec<String>>(),
-                                            true,
-                                        )
-                                        .map_err(anyhow::Error::msg)
+                                        .encode_batch(inputs, true)
+                                        .map_err(E::msg)
                                         .unwrap();
                                     let tokens: Vec<&[u32]> =
                                         encoded.iter().map(|x| x.get_ids()).collect();
@@ -296,6 +421,7 @@ impl OesModelService {
                                         encoded.iter().map(|x| x.get_attention_mask()).collect();
                                     let mask = Tensor::new(mask, &device).unwrap();
                                     let logits = model.forward(&tokens, 0, Some(&mask)).unwrap();
+                                    model.clear_kv_cache(); // this is important to avoid memory leak and crashing
                                     let (_, seq_len, _) = logits.dims3().unwrap();
                                     let embd = logits
                                         .narrow(1, seq_len - 1, 1)
@@ -315,28 +441,228 @@ impl OesModelService {
                                                 .unwrap(),
                                         )
                                         .unwrap();
-                                    tokio::task::yield_now().await;
-
-                                    // Get the text features
-                                    let text_features = norm.to_vec2::<f32>().unwrap();
+                                    let text_embeddings = norm.to_vec2::<f32>().unwrap();
                                     tokio::task::yield_now().await;
 
                                     // Send the responses back to the broker
                                     let mut send_broker = local_broker.clone();
                                     tokio::spawn(async move {
-                                        let responses = received_messages
+                                        let responses = valid_received_messages_headers
                                             .iter()
-                                            .map(|r| r.rendezvous_topic.to_string())
-                                            .zip(text_features.iter().map(|f| {
-                                                EmbeddingMessage::Response(
-                                                    crate::EmbeddingResponse {
-                                                        values: f
-                                                            .iter()
-                                                            .map(|v| *v as f64)
-                                                            .collect(),
-                                                    },
+                                            .zip(text_embeddings.iter())
+                                            .map(|(header, embedding)| {
+                                                (
+                                                    header.rendezvous_topic.to_string(),
+                                                    EmbeddingMessage::Response(
+                                                        crate::EmbeddingResponse {
+                                                            values: embedding
+                                                                .iter()
+                                                                .map(|v| *v as f64)
+                                                                .collect(),
+                                                            ordinal: header.ordinal,
+                                                        },
+                                                    ),
                                                 )
-                                            }))
+                                            })
+                                            .collect::<Vec<_>>();
+                                        send_broker.publish_many(responses).await.unwrap();
+                                    });
+                                }
+                            });
+                        }
+                    }
+                    (OesModel::Whisper, DataType::Audio) => {
+                        for replica_id in 0..encodings_config.replicas {
+                            let path = assets_file_path("melfilters128.bytes");
+                            let mel_bytes = std::fs::read(path).unwrap();
+                            let mel_bytes_slice = mel_bytes.as_slice();
+
+                            let mut mel_filters = vec![0f32; mel_bytes_slice.len() / 4];
+                            <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(
+                                mel_bytes_slice,
+                                &mut mel_filters,
+                            );
+
+                            let (config, _tokenizer, mut model, device) = init_whisper();
+                            let mut local_broker = self.broker.clone();
+                            let receive_topic = create_model_service_topic(
+                                OesAction::Embed,
+                                OesVerb::Request,
+                                OesModel::Whisper,
+                                DataType::Audio,
+                                replica_id,
+                            );
+                            info!(
+                                "{} Model Audio Service replica {} started listening on {}",
+                                serde_json::to_string(&OesModel::Whisper)
+                                    .unwrap()
+                                    .as_str()
+                                    .trim_matches('"')
+                                    .to_string(),
+                                replica_id,
+                                receive_topic
+                            );
+                            tokio::spawn(async move {
+                                loop {
+                                    // Collect messages from broker, filter out non-request messages,
+                                    // and continue if no messages are received
+                                    let received_messages = local_broker
+                                        .try_recv_many(receive_topic.clone(), MAX_BATCH_SIZE)
+                                        .await
+                                        .into_iter()
+                                        .filter_map(|m| match m {
+                                            EmbeddingMessage::Request(r) => Some(r),
+                                            _ => {
+                                                error!("Received non-request message: {:?}", m);
+                                                None
+                                            }
+                                        })
+                                        .collect::<Vec<_>>();
+                                    if received_messages.is_empty() {
+                                        tokio::task::yield_now().await;
+                                        continue;
+                                    }
+                                    info!("Received {:?} messages", received_messages.len());
+
+                                    // ensure the request inputs are valid, for invalid requests send an err
+                                    // to their rendezvous topics if they exist
+                                    let mut send_err_broker = local_broker.clone();
+                                    let (valid_received_messages, invalid_received_messages): (
+                                        Vec<_>,
+                                        Vec<_>,
+                                    ) = received_messages.into_iter().partition(
+                                        |received_message| match received_message.payload {
+                                            crate::Input::Audio(_) => true,
+                                            _ => {
+                                                error!(
+                                                    "Received non-audio input: {:?}",
+                                                    received_message
+                                                );
+                                                false
+                                            }
+                                        },
+                                    );
+                                    let valid_received_messages_headers = valid_received_messages
+                                        .iter()
+                                        .map(|r| r.header.clone())
+                                        .collect::<Vec<_>>();
+                                    let inputs = valid_received_messages
+                                        .into_iter()
+                                        .map(|r| match r.payload {
+                                            crate::Input::Audio(t) => t,
+                                            _ => unreachable!(),
+                                        })
+                                        .collect::<Vec<_>>();
+                                    tokio::spawn(async move {
+                                        let responses = invalid_received_messages
+                                            .into_iter()
+                                            .map(|r| r.header.rendezvous_topic.to_string())
+                                            .unique()
+                                            .filter(|r| send_err_broker.has_topic(r))
+                                            .map(|r| {
+                                                (
+                                                    r.to_string(),
+                                                    EmbeddingMessage::Error(
+                                                        "Invalid input".to_string(),
+                                                    ),
+                                                )
+                                            })
+                                            .collect::<Vec<_>>();
+                                        send_err_broker.publish_many(responses).await.unwrap();
+                                    });
+
+                                    // Process embeddings
+                                    let embedding_tensors = inputs
+                                        .into_iter()
+                                        .map(|(pcm_data, _)| {
+                                            let mel =
+                                                audio::pcm_to_mel(&config, &pcm_data, &mel_filters);
+                                            let mel_len = mel.len();
+                                            let mel = Tensor::from_vec(
+                                                mel,
+                                                (
+                                                    1,
+                                                    config.num_mel_bins,
+                                                    mel_len / config.num_mel_bins,
+                                                ),
+                                                &device,
+                                            )
+                                            .unwrap();
+
+                                            let mut seek = 0;
+                                            let mut embeddings = vec![];
+                                            let (_, _, content_frames) = mel.dims3().unwrap();
+                                            while seek < content_frames {
+                                                let _time_offset = (seek * m::HOP_LENGTH) as f64
+                                                    / m::SAMPLE_RATE as f64;
+                                                let segment_size =
+                                                    usize::min(content_frames - seek, m::N_FRAMES);
+                                                let mel_segment =
+                                                    mel.narrow(2, seek, segment_size).unwrap();
+                                                let _segment_duration =
+                                                    (segment_size * m::HOP_LENGTH) as f64
+                                                        / m::SAMPLE_RATE as f64;
+                                                let embedding = model
+                                                    .encoder
+                                                    .forward(&mel_segment, true)
+                                                    .unwrap();
+                                                info!(
+                                                    "Embedding segment shape: {:?}",
+                                                    embedding.dims()
+                                                );
+                                                model.reset_kv_cache();
+                                                seek += segment_size;
+                                                embeddings.push(embedding);
+                                            }
+
+                                            let all_embedding_tensors = Tensor::cat(&embeddings, 1)
+                                                .unwrap()
+                                                .to_device(&device)
+                                                .unwrap();
+
+                                            let (_n_audio, sequences, n_dim) =
+                                                all_embedding_tensors.dims3().unwrap();
+                                            let mean_embeddings = all_embedding_tensors
+                                                .sum(1)
+                                                .unwrap()
+                                                .div(
+                                                    &Tensor::new(vec![sequences as f32], &device)
+                                                        .unwrap()
+                                                        .broadcast_as(vec![1, n_dim])
+                                                        .unwrap(),
+                                                )
+                                                .unwrap();
+                                            mean_embeddings
+                                        })
+                                        .collect::<Vec<_>>();
+                                    let embedding_tensors = Tensor::cat(&embedding_tensors, 0)
+                                        .unwrap()
+                                        .to_device(&device)
+                                        .unwrap();
+                                    let audio_embeddings =
+                                        embedding_tensors.to_vec2::<f32>().unwrap();
+                                    tokio::task::yield_now().await;
+
+                                    // Send the responses back to the broker
+                                    let mut send_broker = local_broker.clone();
+                                    tokio::spawn(async move {
+                                        let responses = valid_received_messages_headers
+                                            .iter()
+                                            .zip(audio_embeddings.iter())
+                                            .map(|(header, embedding)| {
+                                                (
+                                                    header.rendezvous_topic.to_string(),
+                                                    EmbeddingMessage::Response(
+                                                        crate::EmbeddingResponse {
+                                                            values: embedding
+                                                                .iter()
+                                                                .map(|v| *v as f64)
+                                                                .collect(),
+                                                            ordinal: header.ordinal,
+                                                        },
+                                                    ),
+                                                )
+                                            })
                                             .collect::<Vec<_>>();
                                         send_broker.publish_many(responses).await.unwrap();
                                     });
@@ -444,19 +770,19 @@ pub fn init_clip() -> (Tokenizer, clip::ClipModel, ClipConfig, Device) {
     (tokenizer, model, config, device)
 }
 
-pub fn init_gtwqwen() -> (Tokenizer, qwen2::Model, Device) {
+pub fn init_gteqwen() -> (Tokenizer, QwenModel, Device) {
     let device = device(false).unwrap();
     let api = hf_hub::api::sync::Api::new().unwrap();
     let repo = api.repo(hf_hub::Repo::new(
         "Alibaba-NLP/gte-Qwen1.5-7B-instruct".to_string(),
         hf_hub::RepoType::Model,
     ));
-    info!("info {:?}", repo.info().unwrap());
 
     let config = repo.get("config.json").unwrap();
     let tokenizer = repo.get("tokenizer.json").unwrap();
-    let weights = hub_load_safetensors(&repo, "model.safetensors.index.json").unwrap();
+    let model_file = hub_load_safetensors(&repo, "model.safetensors.index.json").unwrap();
 
+    let mut tokenizer = Tokenizer::from_file(tokenizer).map_err(E::msg).unwrap();
     const EOS_TOKEN: &str = "<|endoftext|>";
     const EOS_TOKEN_ID: u32 = 151643;
     let padding = PaddingParams {
@@ -467,11 +793,37 @@ pub fn init_gtwqwen() -> (Tokenizer, qwen2::Model, Device) {
         pad_type_id: 0,
         pad_token: String::from(EOS_TOKEN),
     };
-    let mut tokenizer = Tokenizer::from_file(tokenizer).map_err(E::msg).unwrap();
     tokenizer.with_padding(Some(padding));
-    let config: Config = serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weights, DType::F32, &device).unwrap() };
-    let model = Model::new(&config, vb).unwrap();
 
+    let config: QwenConfig = serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
+    let vb =
+        unsafe { VarBuilder::from_mmaped_safetensors(&model_file, DType::F32, &device).unwrap() };
+    let model = QwenModel::new(&config, vb).unwrap();
     (tokenizer, model, device)
+}
+
+pub fn init_whisper() -> (Config, Tokenizer, m::model::Whisper, Device) {
+    let device = device(false).unwrap();
+    let api = hf_hub::api::sync::Api::new().unwrap();
+    let repo = api.repo(hf_hub::Repo::with_revision(
+        "openai/whisper-large-v2".to_string(),
+        hf_hub::RepoType::Model,
+        "refs/pr/57".to_string(),
+    ));
+
+    let config = repo.get("config.json").unwrap();
+    let tokenizer = repo.get("tokenizer.json").unwrap();
+    let model = repo.get("model.safetensors").unwrap();
+
+    let config: Config = serde_json::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
+    let tokenizer = Tokenizer::from_file(tokenizer).map_err(E::msg).unwrap();
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model], m::DTYPE, &device).unwrap() };
+    let model = m::model::Whisper::load(&vb, config.clone()).unwrap();
+    (config, tokenizer, model, device)
+}
+
+pub fn assets_file_path(name: &str) -> PathBuf {
+    let base_path = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let assets_path = base_path.join("assets");
+    assets_path.join(name)
 }
