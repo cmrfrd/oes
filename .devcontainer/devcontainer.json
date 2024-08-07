@@ -43,7 +43,8 @@
         "bajdzis.vscode-database",
         "IBM.output-colorizer",
         "GitHub.copilot",
-        "joaompinto.vscode-graphviz"
+        "joaompinto.vscode-graphviz",
+        "ms-python.python"
       ]
     }
   }
