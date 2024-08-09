@@ -1,13 +1,16 @@
 use async_trait::async_trait;
 use axum::extract::*;
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use axum_extra::extract::CookieJar;
 use futures::StreamExt;
 use http::Method;
+use serde::Serialize;
 use serde_json::from_str;
 use std::fmt::Debug;
 use std::io::Cursor;
+use std::sync::Arc;
 use tracing::info;
 
 use crate::apis::embeddings::CreateEmbeddingResponse;
@@ -16,7 +19,7 @@ use crate::apis::models::ListModelsResponse;
 use crate::apis::models::Models;
 use crate::apis::models::RetrieveModelResponse;
 use crate::create_model_service_topic;
-use crate::dataurl_processor::data_type;
+use crate::data_type;
 use crate::list_models;
 use crate::models::Embedding;
 use crate::openai::models;
@@ -38,25 +41,36 @@ use core::panic;
 use data_url::DataUrl;
 use rand::Rng;
 
-pub struct OesBaseService {}
+#[derive(Clone)]
+pub struct OesBaseService {
+    pub(crate) broker: Broker<EmbeddingMessage>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OesBaseServiceStats {
+    pub broker_topics: usize,
+}
 
 impl OesBaseService {
-    pub fn new() -> Self {
+    pub fn new(broker: Broker<EmbeddingMessage>) -> Self {
         info!("Creating OesBaseService");
-        Self {}
+        Self { broker }
     }
 
     pub fn router(self: Self) -> axum::Router {
         Router::new()
             .route("/health", get(|| async { "OK" }))
-            .with_state(self)
+            .route("/stats", get(stats_handler))
+            .with_state(self.into())
     }
 }
 
-impl Clone for OesBaseService {
-    fn clone(&self) -> Self {
-        Self {}
-    }
+async fn stats_handler(State(service): State<Arc<OesBaseService>>) -> impl IntoResponse {
+    let stats = service.broker.stats();
+    let oes_base_stats = OesBaseServiceStats {
+        broker_topics: stats.num_topics,
+    };
+    Json(oes_base_stats)
 }
 
 impl AsRef<OesBaseService> for OesBaseService {
@@ -67,17 +81,14 @@ impl AsRef<OesBaseService> for OesBaseService {
 
 #[derive(Clone)]
 pub struct OesOaiService {
-    broker_client: Broker<EmbeddingMessage>,
+    broker: Broker<EmbeddingMessage>,
     config: OesConfig,
 }
 
 impl OesOaiService {
-    pub fn new(broker_client: Broker<EmbeddingMessage>, config: OesConfig) -> Self {
+    pub fn new(broker: Broker<EmbeddingMessage>, config: OesConfig) -> Self {
         info!("Creating OesOaiService");
-        Self {
-            broker_client,
-            config,
-        }
+        Self { broker, config }
     }
 }
 
@@ -87,12 +98,12 @@ impl AsRef<OesOaiService> for OesOaiService {
     }
 }
 
-struct Guard<T: Debug + Clone + Send + Sync + Unpin + 'static> {
+struct Guard<T: Debug + Clone + Send + Sync + 'static> {
     broker: Broker<T>,
     close_topics: Vec<String>,
 }
 
-impl<T: Debug + Clone + Send + Sync + Unpin + 'static> Guard<T> {
+impl<T: Debug + Clone + Send + Sync + 'static> Guard<T> {
     fn new(broker: Broker<T>, close_topics: Vec<String>) -> Self {
         Self {
             broker,
@@ -101,7 +112,7 @@ impl<T: Debug + Clone + Send + Sync + Unpin + 'static> Guard<T> {
     }
 }
 
-impl<T: Debug + Clone + Send + Sync + Unpin + 'static> Drop for Guard<T> {
+impl<T: Debug + Clone + Send + Sync + 'static> Drop for Guard<T> {
     fn drop(&mut self) {
         for topic in self.close_topics.drain(..) {
             self.broker.unsubscribe(topic);
@@ -259,103 +270,47 @@ impl Embeddings for OesOaiService {
             }
         };
 
-        // // Ensure that all the inputs (if data urls are needed) are valid
-        // let all_valid_inputs = match model_info.data_type {
-        //     DataType::Text => true,
-        //     DataType::Image => input.iter().all(|i| {
-        //         if let Ok(data_url) = DataUrl::process(i) {
-        //             if data_url.mime_type().type_ == "image" {
-        //                 if vec![String::from("png"), String::from("jpeg")]
-        //                     .contains(&data_url.mime_type().subtype)
-        //                 {
-        //                     true
-        //                 } else {
-        //                     false
-        //                 }
-        //             } else {
-        //                 false
-        //             }
-        //         } else {
-        //             false
-        //         }
-        //     }),
-        //     DataType::Audio => input.iter().all(|i| {
-        //         if let Ok(data_url) = DataUrl::process(i) {
-        //             if data_url.mime_type().type_ == "audio" {
-        //                 if vec![String::from("wav")].contains(&data_url.mime_type().subtype) {
-        //                     true
-        //                 } else {
-        //                     false
-        //                 }
-        //             } else {
-        //                 false
-        //             }
-        //         } else {
-        //             false
-        //         }
-        //     }),
-        //     _ => {
-        //         return Ok(CreateEmbeddingResponse::Status400_BadRequest(
-        //             models::Error::new(
-        //                 Nullable::Present(FOUR_HUNDRED.to_string()),
-        //                 BAD_REQUEST.to_string(),
-        //                 Nullable::Present("Unsupported input type".to_string()),
-        //                 "".to_string(),
-        //             ),
-        //         ))
-        //     }
-        // };
-        // if !all_valid_inputs {
-        //     return Ok(CreateEmbeddingResponse::Status400_BadRequest(
-        //         models::Error::new(
-        //             Nullable::Present(FOUR_HUNDRED.to_string()),
-        //             BAD_REQUEST.to_string(),
-        //             Nullable::Present("Invalid input".to_string()),
-        //             "".to_string(),
-        //         ),
-        //     ));
-        // }
-
         // create a rendezvous topic for pubsub to return
         // and subscribe to it.
-        let input_size = input.len();
+        let input_size = converted_inputs.len();
         let rendezvous_topic = uuid::Uuid::new_v4().to_string();
         let also_rendezvous_topic = rendezvous_topic.clone();
-        let _guard = Guard::new(self.broker_client.clone(), vec![rendezvous_topic.clone()]);
-        let mut client_send = self.broker_client.clone();
-        let mut client_recv = self.broker_client.clone();
+        let also_also_rendezvous_topic = rendezvous_topic.clone();
+        let _guard = Guard::new(self.broker.clone(), vec![rendezvous_topic.clone()]);
+        let mut client_send = self.broker.clone();
+        let mut client_recv = self.broker.clone();
 
         info!("Submitting embeddings request: {}", rendezvous_topic);
         let (_, embeddings) = tokio::join!(
             tokio::spawn(async move {
-                let messages =
-                    converted_inputs
-                        .iter()
-                        .cloned()
-                        .enumerate()
-                        .zip((0..input_size).into_iter().map(|_| {
-                            rand::thread_rng().gen::<u32>() % model_encoding_config.replicas
-                        }))
-                        .map(|((index, input), nonce)| (index, input, nonce))
-                        .map(|(index, input, nonce)| {
-                            let topic = create_model_service_topic(
-                                OesAction::Embed,
-                                OesVerb::Request,
-                                model_info.model.clone(),
-                                model_info.data_type.clone(),
-                                nonce,
-                            );
-                            let req = crate::EmbeddingRequest::new(
-                                input.clone(),
-                                rendezvous_topic.clone(),
-                                index.try_into().unwrap(),
-                            );
-                            let message = EmbeddingMessage::Request(req);
+                let messages = converted_inputs
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .zip((0..input_size).into_iter().map(|_| {
+                        rand::thread_rng().gen::<u32>() % model_encoding_config.replicas
+                        // (i as u32) % model_encoding_config.replicas
+                    }))
+                    .map(|((index, input), nonce)| (index, input, nonce))
+                    .map(|(index, input, nonce)| {
+                        let topic = create_model_service_topic(
+                            OesAction::Embed,
+                            OesVerb::Request,
+                            model_info.model.clone(),
+                            model_info.data_type.clone(),
+                            nonce,
+                        );
+                        let req = crate::EmbeddingRequest::new(
+                            input.clone(),
+                            rendezvous_topic.clone(),
+                            index.try_into().unwrap(),
+                        );
+                        let message = EmbeddingMessage::Request(req);
 
-                            (topic, message)
-                        })
-                        .collect();
-                client_send.publish_many(messages).await.unwrap();
+                        (topic, message)
+                    })
+                    .collect();
+                client_send.publish_many(messages, false).await.unwrap();
             }),
             tokio::spawn(async move {
                 let mut embeddings = Vec::with_capacity(input_size);
@@ -375,31 +330,11 @@ impl Embeddings for OesOaiService {
                 }
                 embeddings.sort_by(|a, b| a.index.cmp(&b.index));
                 Ok(embeddings)
-
-                // let embeddings: Vec<Embedding> = client_recv
-                //     .subscribe(also_rendezvous_topic.clone())
-                //     .take(input_size)
-                //     .collect::<Vec<_>>()
-                //     .await
-                //     .into_iter()
-                //     .try_fold(Vec::with_capacity(input_size), |mut acc, v| match v {
-                //         EmbeddingMessage::Response(r) => {
-                //             acc.push(Embedding::new(
-                //                 r.ordinal.try_into().unwrap(),
-                //                 r.values.clone(),
-                //                 "".to_string(),
-                //             ));
-                //             Ok(acc)
-                //         }
-                //         EmbeddingMessage::Error(e) => Err(e)?,
-                //         // _ => panic!("Invalid response"),
-                //         _ => {}
-                //     });
-                // // embeddings.sort_by(|a, b| a.index.cmp(&b.index));
-                // info!("Received embeddings response: {}", also_rendezvous_topic);
-                // embeddings
-                // Vec::new()
             })
+        );
+        info!(
+            "Completing embeddings request: {}",
+            also_also_rendezvous_topic.clone()
         );
 
         match embeddings {

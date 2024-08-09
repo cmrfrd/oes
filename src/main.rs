@@ -7,6 +7,7 @@ use strum::IntoEnumIterator;
 use tabled::{builder::Builder, settings::Style};
 use tokio::net::TcpListener;
 use tower_http::{
+    limit::RequestBodyLimitLayer,
     trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
     LatencyUnit,
 };
@@ -72,15 +73,12 @@ pub async fn start_server(addr: &str, args: RunCli) {
     oes_model_service.run();
 
     info!("Starting OES API");
-    let oes_base = OesBaseService::new();
+    let oes_base = OesBaseService::new(broker.clone());
     let oes_base_service = OesBaseService::router(oes_base);
     let oes_oai = OesOaiService::new(broker.clone(), oes_model_config.clone());
     let oes_oai_service = server::new(oes_oai);
     let app = axum::Router::new()
-        // .layer(DefaultBodyLimit::max(1000 * 1000 * 1000))
         .layer(DefaultBodyLimit::disable())
-        // .layer(RequestBodyLimitLayer::new(1000 * 1000 * 1000)) // 1GB
-        // .layer(extractor_middleware::<ContentLengthLimit<(), 1024>>())
         .layer(
             TraceLayer::new_for_http()
                 .on_body_chunk(|chunk: &Bytes, latency: Duration, _: &tracing::Span| {
@@ -90,10 +88,9 @@ pub async fn start_server(addr: &str, args: RunCli) {
                 .on_response(DefaultOnResponse::new().include_headers(true).latency_unit(LatencyUnit::Micros)),
         )
         // All requests that prefix /oai will go here
-        .layer(DefaultBodyLimit::disable())
+        .layer(RequestBodyLimitLayer::new(500 * 1000 * 1000)) // 500MB
         .nest("/", oes_oai_service)
         .layer(DefaultBodyLimit::disable())
-        // All other requests will go here
         .nest("/", oes_base_service);
 
     let listener = TcpListener::bind(addr).await.unwrap();
@@ -101,7 +98,7 @@ pub async fn start_server(addr: &str, args: RunCli) {
     axum::serve(listener, app).await.unwrap();
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 32)]
 async fn main() {
     let cli = Cli::parse();
     match cli.command {

@@ -2,7 +2,6 @@
 
 pub mod broker;
 pub mod config;
-pub mod dataurl_processor;
 pub mod messages;
 pub mod model_service;
 pub mod openai;
@@ -20,6 +19,7 @@ pub use crate::openai::*;
 pub use crate::server::*;
 
 use anyhow::{Context, Result};
+use data_url::DataUrl;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,7 +30,7 @@ use symphonia::core::conv::FromSample;
 use symphonia::core::io::MediaSource;
 
 pub const OWNER: &str = "oes";
-pub const DEFAULT_TOPIC_CHANNEL_SIZE: usize = 256;
+pub const DEFAULT_TOPIC_CHANNEL_SIZE: usize = 1024;
 pub const MAX_BATCH_SIZE: usize = 32;
 
 pub const BAD_REQUEST: &str = "Bad Request";
@@ -226,4 +226,16 @@ pub(crate) fn pcm_decode_raw(
         }
     }
     Ok((pcm_data, sample_rate))
+}
+
+pub fn data_type(data_url: &DataUrl) -> anyhow::Result<DataType> {
+    let mime_type = data_url.mime_type().type_.as_str();
+    let mime_subtype = data_url.mime_type().subtype.as_str();
+    match (mime_type, mime_subtype) {
+        ("text", "plain") => Ok(DataType::Text),
+        ("image", "png") => Ok(DataType::Image),
+        ("image", "jpeg") => Ok(DataType::Image),
+        ("audio", "wav") => Ok(DataType::Audio),
+        (t, st) => Err(anyhow::anyhow!("Unsupported media type: {}/{}", t, st)),
+    }
 }

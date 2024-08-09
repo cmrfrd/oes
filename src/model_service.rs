@@ -52,13 +52,13 @@ impl OesModelService {
                                 "CLIP Model Text Service replica {} started listening on {}",
                                 replica_id, receive_topic
                             );
+
                             tokio::spawn(async move {
                                 loop {
                                     // Collect messages from broker, filter out non-request messages,
                                     // and continue if no messages are received
                                     let received_messages = local_broker
                                         .try_recv_many(receive_topic.clone(), MAX_BATCH_SIZE)
-                                        .await
                                         .into_iter()
                                         .filter_map(|m| match m {
                                             EmbeddingMessage::Request(r) => Some(r),
@@ -117,7 +117,10 @@ impl OesModelService {
                                                 )
                                             })
                                             .collect::<Vec<_>>();
-                                        send_err_broker.publish_many(responses).await.unwrap();
+                                        send_err_broker
+                                            .publish_many(responses, true)
+                                            .await
+                                            .unwrap();
                                     });
 
                                     // Process embeddings
@@ -128,7 +131,6 @@ impl OesModelService {
                                         .unwrap()
                                         .to_vec2::<f32>()
                                         .unwrap();
-                                    tokio::task::yield_now().await;
 
                                     // Send the responses back to the broker
                                     let mut send_broker = local_broker.clone();
@@ -151,7 +153,7 @@ impl OesModelService {
                                                 )
                                             })
                                             .collect::<Vec<_>>();
-                                        send_broker.publish_many(responses).await.unwrap();
+                                        send_broker.publish_many(responses, true).await.unwrap();
                                     });
                                 }
                             });
@@ -178,7 +180,6 @@ impl OesModelService {
                                     // and continue if no messages are received
                                     let received_messages = local_broker
                                         .try_recv_many(receive_topic.clone(), MAX_BATCH_SIZE)
-                                        .await
                                         .into_iter()
                                         .filter_map(|m| match m {
                                             EmbeddingMessage::Request(r) => Some(r),
@@ -237,7 +238,10 @@ impl OesModelService {
                                                 )
                                             })
                                             .collect::<Vec<_>>();
-                                        send_err_broker.publish_many(responses).await.unwrap();
+                                        send_err_broker
+                                            .publish_many(responses, true)
+                                            .await
+                                            .unwrap();
                                     });
 
                                     // Get the image features
@@ -302,7 +306,7 @@ impl OesModelService {
                                                 )
                                             })
                                             .collect::<Vec<_>>();
-                                        send_broker.publish_many(responses).await.unwrap();
+                                        send_broker.publish_many(responses, true).await.unwrap();
                                     });
                                 }
                             });
@@ -335,7 +339,6 @@ impl OesModelService {
                                     // and continue if no messages are received
                                     let received_messages = local_broker
                                         .try_recv_many(receive_topic.clone(), MAX_BATCH_SIZE)
-                                        .await
                                         .into_iter()
                                         .filter_map(|m| match m {
                                             EmbeddingMessage::Request(r) => Some(r),
@@ -349,7 +352,6 @@ impl OesModelService {
                                         tokio::task::yield_now().await;
                                         continue;
                                     }
-                                    info!("Received {:?} messages", received_messages.len());
 
                                     // ensure the request inputs are valid, for invalid requests send an err
                                     // to their rendezvous topics if they exist
@@ -395,7 +397,10 @@ impl OesModelService {
                                                 )
                                             })
                                             .collect::<Vec<_>>();
-                                        send_err_broker.publish_many(responses).await.unwrap();
+                                        send_err_broker
+                                            .publish_many(responses, true)
+                                            .await
+                                            .unwrap();
                                     });
 
                                     // Process embeddings
@@ -465,7 +470,7 @@ impl OesModelService {
                                                 )
                                             })
                                             .collect::<Vec<_>>();
-                                        send_broker.publish_many(responses).await.unwrap();
+                                        send_broker.publish_many(responses, true).await.unwrap();
                                     });
                                 }
                             });
@@ -508,7 +513,6 @@ impl OesModelService {
                                     // and continue if no messages are received
                                     let received_messages = local_broker
                                         .try_recv_many(receive_topic.clone(), MAX_BATCH_SIZE)
-                                        .await
                                         .into_iter()
                                         .filter_map(|m| match m {
                                             EmbeddingMessage::Request(r) => Some(r),
@@ -522,7 +526,6 @@ impl OesModelService {
                                         tokio::task::yield_now().await;
                                         continue;
                                     }
-                                    info!("Received {:?} messages", received_messages.len());
 
                                     // ensure the request inputs are valid, for invalid requests send an err
                                     // to their rendezvous topics if they exist
@@ -568,7 +571,10 @@ impl OesModelService {
                                                 )
                                             })
                                             .collect::<Vec<_>>();
-                                        send_err_broker.publish_many(responses).await.unwrap();
+                                        send_err_broker
+                                            .publish_many(responses, true)
+                                            .await
+                                            .unwrap();
                                     });
 
                                     // Process embeddings
@@ -664,7 +670,7 @@ impl OesModelService {
                                                 )
                                             })
                                             .collect::<Vec<_>>();
-                                        send_broker.publish_many(responses).await.unwrap();
+                                        send_broker.publish_many(responses, true).await.unwrap();
                                     });
                                 }
                             });
