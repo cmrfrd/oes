@@ -1,2 +1,7 @@
-**/target
-**/data
+Dockerfile
+.dockerignore
+.git
+target
+data
+doc
+*.md
